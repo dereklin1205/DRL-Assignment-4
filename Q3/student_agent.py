@@ -44,7 +44,7 @@ class Agent(object):
         self.action_space_high = env.action_space.high
         self.action_space = gym.spaces.Box(-1.0, 1.0, (21,), np.float64)
         self.agent = SACAgent(self.state_dim, self.action_dim, self.action_space_low, self.action_space_high, 256)
-        self.agent.load("./sac_humanoid_models")
+        self.agent.load_models("./sac_humanoid_models")
         self.agent.eval()
     def act(self, observation):
         return self.agent.select_action(observation, evaluate=True)
