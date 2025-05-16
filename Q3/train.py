@@ -404,4 +404,5 @@ if __name__ == "__main__":
     import os
     if not os.path.exists("./sac_humanoid_models"):
         os.makedirs("./sac_humanoid_models")
+    print("123")
     train()
