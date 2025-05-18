@@ -52,3 +52,22 @@ class Agent(object):
 
     def act(self, observation):
         return self.agent.select_action(observation, evaluate=True)
+if __name__ == "__main__":
+    env = make_env()
+    agent = Agent()
+    seed = np.random.randint(0, 1000000)
+    obs, _ = env.reset(seed=seed) # Reset the environment and get the initial observation
+    done = False
+    total_reward = 0
+    # print(obs[0].shape)
+    while not done :
+        
+        action = agent.act(obs)
+        obs, reward, done,truncated, info = env.step(action)
+        env.render()
+        done = done or truncated
+        # time.sleep(0.01)  # Add a small delay to visualize the rendering
+        total_reward += reward
+    # Close the environment after the loop
+    print(f"Total reward: {total_reward}")
+    env.close()
