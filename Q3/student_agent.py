@@ -17,7 +17,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dmc import make_dmc_env
-from train import SACAgent
+from checkpoints.Continue_train import SACAgent
 # Do not modify the input of the 'act' function and the '__init__' function. 
 RANDOM_SEED = 42
 def make_env():
@@ -44,7 +44,7 @@ class Agent(object):
         self.action_space_high = env.action_space.high
         self.action_space = gym.spaces.Box(-1.0, 1.0, (21,), np.float64)
         self.agent = SACAgent(self.state_dim, self.action_dim, self.action_space_low, self.action_space_high, 512)
-        self.agent.load_models("./sac_humanoid_models")
+        self.agent.load_models(path = "./checkpoints/sac_humanoid_model_train_new/best", prefix="best")
         self.agent.actor.eval() # Set to eval mode if loading for inference
         self.agent.critic_net.eval()
         self.agent.value_net.eval()
