@@ -17,7 +17,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dmc import make_dmc_env
-from checkpoints.Continue_train import SACAgent
+from train import SACAgent
 # Do not modify the input of the 'act' function and the '__init__' function. 
 RANDOM_SEED = 42
 def make_env():

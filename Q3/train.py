@@ -41,7 +41,7 @@ LR_VALUE = 3e-4       # Learning rate for value network
 LR_ALPHA = 3e-4       # Learning rate for temperature alpha
 GAMMA = 0.99          # Discount factor
 TAU = 0.005           # Target network soft update rate
-ALPHA_INITIAL = 1  # Initial temperature, can be learned (or fixed if AUTO_TUNE_ALPHA=False)
+ALPHA_INITIAL = 0.2 # Initial temperature, can be learned (or fixed if AUTO_TUNE_ALPHA=False)
 REPLAY_BUFFER_SIZE = int(1e6)
 BATCH_SIZE = 256
 HIDDEN_DIM = 512
@@ -49,7 +49,12 @@ LOG_STD_MIN = -20     # Min log standard deviation for actor
 LOG_STD_MAX = 2       # Max log standard deviation for actor
 TARGET_ENTROPY = None # If None, will be set to -action_dim
 AUTO_TUNE_ALPHA = True # Whether to automatically tune the temperature alpha
-
+def weight_init(m):
+	"""Custom weight initialization for better training convergence"""
+	if isinstance(m, nn.Linear):
+		nn.init.orthogonal_(m.weight.data, gain=1.0)
+		if m.bias is not None:
+			nn.init.constant_(m.bias.data, 0.0)
 # --- Networks ---
 class ReplayBuffer:
     def __init__(self, capacity):
@@ -70,6 +75,23 @@ class ReplayBuffer:
 
     def __len__(self):
         return len(self.buffer)
+    
+    def save(self, path):
+        """Save replay buffer to a file"""
+        buffer_data = np.array(list(self.buffer), dtype=object)
+        np.save(f"{path}/replay_buffer.npy", buffer_data)
+        print(f"Replay buffer saved to {path}/replay_buffer.npy")
+    
+    def load(self, path):
+        """Load replay buffer from a file"""
+        try:
+            buffer_data = np.load(f"{path}/replay_buffer.npy", allow_pickle=True)
+            self.buffer = deque(list(buffer_data), maxlen=self.buffer.maxlen)
+            print(f"Loaded {len(self.buffer)} transitions from {path}/replay_buffer.npy")
+            return True
+        except FileNotFoundError:
+            print(f"No replay buffer found at {path}/replay_buffer.npy")
+            return False
 
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim, hidden_dim):
@@ -77,7 +99,7 @@ class ValueNetwork(nn.Module):
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, 1)
-
+        self.apply(weight_init) # Apply custom weight initialization
     def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
@@ -97,7 +119,7 @@ class CriticNetwork(nn.Module): # Q-Network
         self.fc2_q2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3_q2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc4_q2 = nn.Linear(hidden_dim, 1)
-
+        self.apply(weight_init) # Apply custom weight initialization
     def forward(self, state, action):
         sa = torch.cat([state, action], 1)
 
@@ -133,6 +155,7 @@ class ActorNetwork(nn.Module): # Policy Network
         # Action scaling
         self.action_scale = torch.FloatTensor((action_space_high - action_space_low) / 2.0).to(DEVICE)
         self.action_bias = torch.FloatTensor((action_space_high + action_space_low) / 2.0).to(DEVICE)
+        self.apply(weight_init) # Apply custom weight initialization
     def forward(self, state):
         x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
@@ -228,6 +251,7 @@ class SACAgent:
 
         self.value_optimizer.zero_grad()
         value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0) # Gradient clipping
         self.value_optimizer.step()
 
         # --- Update Critic Networks (Q-networks) ---
@@ -243,6 +267,7 @@ class SACAgent:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic_net.parameters(), 1.0) # Gradient clipping
         self.critic_optimizer.step()
 
         # --- Update Actor Network (Policy) ---
@@ -256,6 +281,7 @@ class SACAgent:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0) # Gradient clipping
         self.actor_optimizer.step()
 
         # --- Update Temperature (alpha) ---
@@ -275,35 +301,136 @@ class SACAgent:
 
         return value_loss.item(), critic_loss.item(), actor_loss.item(), self.alpha.item()
 
-    def save_models(self, path="."):
-        torch.save(self.actor.state_dict(), f"{path}/sac_actor.pth")
-        torch.save(self.critic_net.state_dict(), f"{path}/sac_critic.pth")
-        torch.save(self.value_net.state_dict(), f"{path}/sac_value.pth")
+    def save_models(self, path=".", prefix="sac"):
+        """Save all model parameters with an optional prefix"""
+        os.makedirs(path, exist_ok=True)
+        torch.save(self.actor.state_dict(), f"{path}/{prefix}_actor.pth")
+        torch.save(self.critic_net.state_dict(), f"{path}/{prefix}_critic.pth")
+        torch.save(self.value_net.state_dict(), f"{path}/{prefix}_value.pth")
         if self.auto_tune_alpha:
             # Save log_alpha as it's the parameter being optimized
-            torch.save(self.log_alpha, f"{path}/sac_log_alpha.pth")
-        print(f"Models saved to {path}")
+            torch.save(self.log_alpha, f"{path}/{prefix}_log_alpha.pth")
+        print(f"Models saved to {path} with prefix {prefix}")
 
-    def load_models(self, path="."):
-        self.actor.load_state_dict(torch.load(f"{path}/sac_actor.pth", map_location=DEVICE))
-        self.critic_net.load_state_dict(torch.load(f"{path}/sac_critic.pth", map_location=DEVICE))
-        self.value_net.load_state_dict(torch.load(f"{path}/sac_value.pth", map_location=DEVICE))
-        self.target_value_net.load_state_dict(self.value_net.state_dict()) # Sync target V with loaded V
-        if self.auto_tune_alpha:
-            self.log_alpha = torch.load(f"{path}/sac_log_alpha.pth", map_location=DEVICE)
-            self.log_alpha.requires_grad_(True) # Ensure it's a leaf tensor with grad
-            self.alpha = self.log_alpha.exp().detach()
-            # Re-initialize alpha_optimizer if it was saved/loaded or ensure it tracks the loaded log_alpha
-            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LR_ALPHA)
+    def load_models(self, path=".", prefix="sac"):
+        """Load all model parameters with an optional prefix"""
+        try:
+            self.actor.load_state_dict(torch.load(f"{path}/{prefix}_actor.pth", map_location=DEVICE))
+            self.critic_net.load_state_dict(torch.load(f"{path}/{prefix}_critic.pth", map_location=DEVICE))
+            self.value_net.load_state_dict(torch.load(f"{path}/{prefix}_value.pth", map_location=DEVICE))
+            self.target_value_net.load_state_dict(self.value_net.state_dict()) # Sync target V with loaded V
+            if self.auto_tune_alpha:
+                self.log_alpha = torch.load(f"{path}/{prefix}_log_alpha.pth", map_location=DEVICE)
+                self.log_alpha.requires_grad_(True) # Ensure it's a leaf tensor with grad
+                self.alpha = self.log_alpha.exp().detach()
+                # Re-initialize alpha_optimizer to track the loaded log_alpha
+                self.alpha_optimizer = optim.Adam([self.log_alpha], lr=LR_ALPHA)
 
-        print(f"Models loaded from {path}")
-        self.actor.eval() # Set to eval mode if loading for inference
-        self.critic_net.eval()
-        self.value_net.eval()
+            print(f"Models loaded from {path} with prefix {prefix}")
+            return True
+        except FileNotFoundError as e:
+            print(f"Could not load models: {e}")
+            return False
+
+
+# --- Training Configuration ---
+class TrainingConfig:
+    def __init__(self):
+        self.max_episodes = 10000        # Total number of episodes to train for
+        self.max_steps_per_episode = 1000 # DMC tasks typically run for 1000 steps
+        self.log_interval = 10           # Log training status every N episodes
+        self.save_interval = 200         # Save models every N episodes
+        self.warmup_steps = BATCH_SIZE * 10  # Collect some random experiences before starting training
+        self.updates_per_step = 1        # Number of agent updates per environment step after warmup
+        self.eval_episodes = 10          # Number of episodes to average for evaluation
+        self.continue_training = False   # Whether to continue from a previous training run
+        self.save_best = True            # Whether to save the best model based on evaluation performance
+        self.save_buffer = True          # Whether to save the replay buffer when saving models
+        self.checkpoint_dir = "./sac_humanoid_models"  # Directory for saving/loading checkpoints
+        self.best_model_dir = "./sac_humanoid_models/best"  # Directory for saving best model
+        self.reward_scaling = 5.0        # Factor to scale rewards by
+        
+        # Create directories
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        os.makedirs(self.best_model_dir, exist_ok=True)
+
+
+# --- Utility Functions ---
+def evaluate_agent(agent, env, config):
+    """Evaluate agent over multiple episodes and return average reward"""
+    avg_reward = 0
+    for i in range(config.eval_episodes):
+        eval_state, _ = env.reset()
+        episode_reward = 0
+        for _ in range(config.max_steps_per_episode):
+            eval_action = agent.select_action(eval_state, evaluate=True)
+            eval_next_state, eval_reward, eval_term, eval_trunc, _ = env.step(eval_action)
+            episode_reward += eval_reward
+            eval_state = eval_next_state
+            if eval_term or eval_trunc:
+                break
+        avg_reward += episode_reward
+    avg_reward /= config.eval_episodes
+    return avg_reward
+
+
+def save_training_state(agent, buffer, config, episode, total_steps, best_eval_reward):
+    """Save training state including agent models, replay buffer, and metadata"""
+    # Save metadata
+    metadata = {
+        "episode": episode,
+        "total_steps": total_steps,
+        "best_eval_reward": best_eval_reward,
+    }
+    import json
+    with open(f"{config.checkpoint_dir}/metadata.json", "w") as f:
+        json.dump(metadata, f)
+    
+    # Save agent models
+    agent.save_models(path=config.checkpoint_dir)
+    
+    # Save replay buffer if configured
+    if config.save_buffer:
+        buffer.save(config.checkpoint_dir)
+
+
+def load_training_state(agent, buffer, config):
+    """Load training state including agent models, replay buffer, and metadata"""
+    # Load metadata
+    import json
+    try:
+        with open(f"{config.checkpoint_dir}/metadata.json", "r") as f:
+            metadata = json.load(f)
+        episode = metadata["episode"]
+        total_steps = metadata["total_steps"]
+        best_eval_reward = metadata["best_eval_reward"]
+        
+        # Load agent models
+        models_loaded = agent.load_models(path=config.checkpoint_dir)
+        
+        # Load replay buffer if it exists
+        buffer_loaded = False
+        if config.save_buffer:
+            buffer_loaded = buffer.load(config.checkpoint_dir)
+        
+        if models_loaded:
+            print(f"Resuming training from episode {episode+1}, total steps {total_steps}")
+            print(f"Best evaluation reward so far: {best_eval_reward:.2f}")
+            return episode, total_steps, best_eval_reward, True
+        
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Could not load training state: {e}")
+    
+    # If we're here, loading failed
+    print("Starting training from scratch")
+    return 0, 0, float('-inf'), False
 
 
 # --- Main Training Loop ---
-def train():
+def train(config=None):
+    if config is None:
+        config = TrainingConfig()
+        
     print(f"Training on device: {DEVICE}")
     env = make_env()
 
@@ -311,9 +438,6 @@ def train():
     np.random.seed(RANDOM_SEED)
     torch.manual_seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
-    # Note: DMC envs are seeded at creation via task_kwargs.
-    # For action space sampling during warmup if it's a Box space:
-    # env.action_space.seed(RANDOM_SEED) # If using a gym.spaces.Box like wrapper
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -328,81 +452,199 @@ def train():
         TARGET_ENTROPY = -float(action_dim) # Heuristic for continuous action spaces
         print(f"Target entropy automatically set to: {TARGET_ENTROPY:.2f}")
 
+    # Initialize agent and replay buffer
     agent = SACAgent(state_dim, action_dim, action_space_low, action_space_high, HIDDEN_DIM)
     replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE)
 
-    max_episodes = 10000  # Total number of episodes to train for
-    max_steps_per_episode = 1000 # DMC tasks typically run for 1000 steps
-    log_interval = 10     # Log training status every N episodes
-    save_interval = 200   # Save models every N episodes
-    warmup_steps = BATCH_SIZE * 10 # Collect some random experiences before starting training
-    updates_per_step = 1 # Number of agent updates per environment step after warmup
+    # Initialize training state variables
+    start_episode = 0
+    total_steps = 0
+    best_eval_reward = float('-inf')
+    
+    # Load previous training state if continuing training
+    if config.continue_training:
+        start_episode, total_steps, best_eval_reward, success = load_training_state(agent, replay_buffer, config)
+        if not success and config.continue_training:
+            print("Warning: Failed to load previous training state but continue_training=True")
+            print("Proceeding with new training run")
+
     current_alpha = agent.alpha.item() # Initialize current alpha for logging
     v_loss, c_loss, a_loss = 0.0, 0.0, 0.0 # Initialize losses for logging
-    total_steps = 0
-    for episode in range(1, max_episodes + 1):
+
+    for episode in range(start_episode + 1, config.max_episodes + 1):
         seed = np.random.randint(0, 1000000) # Random seed for each episode
-        state, _ = env.reset(seed = seed)
-        # print(f"Seed = {seed}")
+        state, _ = env.reset(seed=seed)
         episode_reward = 0
         episode_steps = 0
 
-        for step_in_episode in range(max_steps_per_episode):
-            if total_steps < warmup_steps:
-                action = env.action_space.sample() # Sample random action
+        for step_in_episode in range(config.max_steps_per_episode):
+            if total_steps < config.warmup_steps and len(replay_buffer) < BATCH_SIZE:
+                action = env.action_space.sample() # Sample random action during warmup
             else:
                 action = agent.select_action(state)
 
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated # In DMC, terminated is the primary 'done' signal
-            shaped_reward = reward*5.0 # Modify this if you want to shape the reward (e.g. scaled, clipped, etc.)
+            shaped_reward = reward * config.reward_scaling # Shape the reward
             replay_buffer.push(state, action, shaped_reward, next_state, float(done)) # Store done as float (0.0 or 1.0)
             state = next_state
             episode_reward += reward
             total_steps += 1
             episode_steps += 1
 
-            if len(replay_buffer) > BATCH_SIZE and total_steps >= warmup_steps:
-                for _ in range(updates_per_step): # Perform one or more updates
+            if len(replay_buffer) > BATCH_SIZE and total_steps >= config.warmup_steps:
+                for _ in range(config.updates_per_step): # Perform one or more updates
                     v_loss, c_loss, a_loss, current_alpha = agent.update(replay_buffer, BATCH_SIZE)
-
-                # if total_steps % (updates_per_step * 200) == 0: # Log losses occasionally (e.g. every 200 updates)
-                #     print(f"Ep: {episode}, TotSteps: {total_steps}, V_Loss: {v_loss:.3f}, "
-                #           f"C_Loss: {c_loss:.3f}, A_Loss: {a_loss:.3f}, Alpha: {current_alpha:.3f}")
 
             if done:
                 break
+                
+        # Log episode statistics
         print(f"Episode: {episode}, Total Steps: {total_steps}, Episode Reward: {episode_reward:.2f}, Episode Steps: {episode_steps}, Alpha: {current_alpha:.3f},V_LOSS: {v_loss:.3f}, C_LOSS: {c_loss:.3f}, A_LOSS: {a_loss:.3f}")
         
-        if episode % log_interval == 0:
-            avg_reward_eval = 0
-            eval_episodes = 3 # Number of episodes to average for evaluation
-            for _ in range(eval_episodes):
-                eval_state, _ = env.reset()
-                eval_episode_reward = 0
-                for _ in range(max_steps_per_episode):
-                    eval_action = agent.select_action(eval_state, evaluate=True)
-                    eval_next_state, eval_reward, eval_term, eval_trunc, _ = env.step(eval_action)
-                    eval_episode_reward += eval_reward
-                    eval_state = eval_next_state
-                    if eval_term or eval_trunc:
-                        break
-                avg_reward_eval += eval_episode_reward
-            avg_reward_eval /= eval_episodes
-
+        # Periodic evaluation and saving
+        if episode % config.log_interval == 0:
+            # Evaluate agent performance
+            avg_reward_eval = evaluate_agent(agent, env, config)
+            
             print(f"--------------------------------------------------------")
             print(f"Episode: {episode}, Total Steps: {total_steps}, Train Reward: {episode_reward:.2f}, Avg Eval Reward: {avg_reward_eval:.2f}, Ep Steps: {episode_steps}")
             print(f"--------------------------------------------------------")
+            
+            # Save best model if performance improves
+            if config.save_best and avg_reward_eval > best_eval_reward:
+                best_eval_reward = avg_reward_eval
+                agent.save_models(path=config.best_model_dir, prefix="best")
+                print(f"New best model saved with reward: {best_eval_reward:.2f}")
+        
+        # Regular checkpoint saving
+        if episode % config.save_interval == 0 and total_steps > config.warmup_steps:
+            save_training_state(agent, replay_buffer, config, episode, total_steps, best_eval_reward)
+            print(f"Checkpoint saved at episode {episode}")
+
+    # Final save at the end of training
+    save_training_state(agent, replay_buffer, config, config.max_episodes, total_steps, best_eval_reward)
+    print("Training complete!")
 
 
-        if episode % save_interval == 0 and total_steps > warmup_steps:
-            agent.save_models(path="./sac_humanoid_models")
+def evaluate(model_dir="./sac_humanoid_models/best", num_episodes=10, render=False):
+    """Evaluate a trained agent for a number of episodes"""
+    print(f"Evaluating agent from {model_dir}")
+    env = make_env()
+    
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    action_space_low = env.action_space.low
+    action_space_high = env.action_space.high
+    
+    # Initialize agent
+    agent = SACAgent(state_dim, action_dim, action_space_low, action_space_high, HIDDEN_DIM)
+    
+    # Try to load the best model first, fall back to regular checkpoint if not found
+    try:
+        success = agent.load_models(path=model_dir, prefix="best")
+        if not success:
+            success = agent.load_models(path=model_dir)
+        if not success:
+            print(f"No models found in {model_dir}")
+            return
+    except Exception as e:
+        print(f"Error loading models: {e}")
+        return
+    
+    # Set agent to evaluation mode
+    agent.actor.eval()
+    
+    # Evaluate for several episodes
+    total_rewards = []
+    for episode in range(1, num_episodes+1):
+        state, _ = env.reset()
+        episode_reward = 0
+        done = False
+        step = 0
+        
+        while not done and step < 1000:  # Max steps to avoid infinite episodes
+            action = agent.select_action(state, evaluate=True)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            episode_reward += reward
+            state = next_state
+            done = terminated or truncated
+            step += 1
+            
+        total_rewards.append(episode_reward)
+        print(f"Episode {episode}/{num_episodes}: Reward = {episode_reward:.2f}, Steps = {step}")
+    
+    # Print statistics
+    avg_reward = sum(total_rewards) / len(total_rewards)
+    std_reward = np.std(total_rewards)
+    min_reward = min(total_rewards)
+    max_reward = max(total_rewards)
+    
+    print("\n--- Evaluation Results ---")
+    print(f"Episodes: {num_episodes}")
+    print(f"Average Reward: {avg_reward:.2f} ± {std_reward:.2f}")
+    print(f"Min/Max Reward: {min_reward:.2f}/{max_reward:.2f}")
+    print("-------------------------")
 
-    # env.close() # If your env wrapper has a close method, call it here. DMC usually doesn't require explicit close.
 
 if __name__ == "__main__":
-    import os
-    if not os.path.exists("./sac_humanoid_models"):
-        os.makedirs("./sac_humanoid_models")
-    print("123")
-    train()
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Train or evaluate SAC agent on DMC humanoid-walk task")
+    
+    # Mode selection
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--train", action="store_true", help="Train the agent")
+    mode_group.add_argument("--evaluate", action="store_true", help="Evaluate the agent")
+    
+    # Training arguments
+    parser.add_argument("--continue_training", action="store_true", help="Continue from previous checkpoint")
+    parser.add_argument("--model_dir", type=str, default="./sac_humanoid_model_train_new", 
+                        help="Directory for saving/loading models")
+    parser.add_argument("--best_model_dir", type=str, default=None,
+                        help="Directory for saving best models (defaults to model_dir/best)")
+    parser.add_argument("--max_episodes", type=int, default=10000, 
+                        help="Maximum number of episodes for training")
+    parser.add_argument("--save_interval", type=int, default=200,
+                        help="Save checkpoint every N episodes")
+    parser.add_argument("--log_interval", type=int, default=10,
+                        help="Log and evaluate every N episodes")
+    parser.add_argument("--reward_scaling", type=float, default=5.0,
+                        help="Factor to scale rewards by")
+    
+    # Evaluation arguments
+    parser.add_argument("--eval_episodes", type=int, default=10,
+                        help="Number of episodes to evaluate")
+                        
+    args = parser.parse_args()
+    
+    # Handle model directories
+    model_dir = args.model_dir
+    best_model_dir = args.best_model_dir if args.best_model_dir else os.path.join(model_dir, "best")
+    
+    # Create necessary directories
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(best_model_dir, exist_ok=True)
+    
+    if args.train:
+        # Configure training
+        config = TrainingConfig()
+        config.continue_training = args.continue_training
+        config.checkpoint_dir = model_dir
+        config.best_model_dir = best_model_dir
+        config.max_episodes = args.max_episodes
+        config.save_interval = args.save_interval
+        config.log_interval = args.log_interval
+        config.reward_scaling = args.reward_scaling
+        
+        # Start training
+        print(f"Training agent with config:")
+        print(f"  Model directory: {model_dir}")
+        print(f"  Best model directory: {best_model_dir}")
+        print(f"  Continue training: {args.continue_training}")
+        print(f"  Max episodes: {args.max_episodes}")
+        print(f"  Reward scaling: {args.reward_scaling}")
+        train(config=config)
+        
+    elif args.evaluate:
+        # Start evaluation
+        evaluate(model_dir=model_dir, num_episodes=args.eval_episodes)
